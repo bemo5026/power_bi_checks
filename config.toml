@@ -1,0 +1,20 @@
+# Run configuration for: .venv\Scripts\python -m snowflake_lineage
+
+# Semantic models to read, by name or ID (the ID is in the model's URL:
+# app.powerbi.com/groups/<workspace ID>/datasets/<model ID>/...).
+# Leave empty to read every semantic model of the workspaces below, including
+# models no report uses (slow when no workspace is set).
+semantic_models = [
+   #"609437c8-c8f1-4647-afa0-1d6ea7c4468f"
+   ]
+
+# Workspaces whose semantic models are read, by name or ID. "My workspace" is the personal one.
+# Leave empty for every workspace you can access. Reports are always looked up in every
+# workspace, so report counts include reports from other workspaces.
+workspaces = ["def0e851-20fa-42ba-8e72-bd5b9bcf8e2a"]
+
+# Folder for the result files.
+output_dir = "output"
+
+# Number of model definitions downloaded at the same time.
+parallel = 8
