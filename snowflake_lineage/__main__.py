@@ -1,12 +1,11 @@
-"""Command line entry point: read the configured models, then write the Snowflake lineage CSV files."""
+"""Command line entry point: read the configured models, then write the Snowflake lineage workbook."""
 
 import argparse
-import csv
-import json
 import sys
 from collections import Counter
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,8 @@ from dotenv import load_dotenv
 
 from snowflake_lineage.auth import get_access_token
 from snowflake_lineage.config import Config, load_config
+from snowflake_lineage.definition_cache import load_definitions, save_definition
+from snowflake_lineage.excel import write_workbook
 from snowflake_lineage.lineage import (
     LineageRow,
     Model,
@@ -29,6 +30,7 @@ from snowflake_lineage.lineage import (
     summarize_objects,
 )
 from snowflake_lineage.powerbi_api import (
+    TRANSIENT_ERRORS,
     create_session,
     get_model_definition,
     list_reports,
@@ -37,6 +39,8 @@ from snowflake_lineage.powerbi_api import (
 )
 
 UNAUTHORIZED = 401
+WORKBOOK_NAME = "snowflake_lineage.xlsx"
+DEFINITIONS_DIR = "model_definitions"
 
 
 @dataclass(frozen=True)
@@ -147,53 +151,44 @@ def download_definitions(
     session: requests.Session,
     model_keys: list[ModelKey],
     parallel: int,
-) -> tuple[dict[ModelKey, dict[str, Any]], dict[ModelKey, str]]:
-    """Download model definitions in parallel and return them with the failures by model.
+) -> Iterator[tuple[ModelKey, dict[str, Any] | None, str | None]]:
+    """Download model definitions in parallel, yielding (model, definition, None) or (model, None, error).
 
-    A failure on one model (no edit access, unsupported model type) is
-    recorded and the others continue. An expired token stops the run.
+    A failure on one model (no edit access, unsupported model type, network
+    errors that outlast the retries) is yielded and the others continue. An
+    expired token stops the run.
     """
-    definitions: dict[ModelKey, dict[str, Any]] = {}
-    failures: dict[ModelKey, str] = {}
     with ThreadPoolExecutor(max_workers=parallel) as executor:
         futures = {executor.submit(get_model_definition, session, *key): key for key in model_keys}
-        for done, future in enumerate(as_completed(futures), start=1):
+        for future in as_completed(futures):
             key = futures[future]
             try:
-                definitions[key] = future.result()
-            except (requests.HTTPError, RuntimeError, TimeoutError) as error:
+                definition = future.result()
+            except (requests.HTTPError, RuntimeError, TimeoutError, *TRANSIENT_ERRORS) as error:
                 response = getattr(error, "response", None)
                 if response is not None and response.status_code == UNAUTHORIZED:
                     executor.shutdown(cancel_futures=True)
                     raise
-                failures[key] = " ".join(str(error).split())[:500]
-            if done % 25 == 0 or done == len(futures):
-                print(f"  {done}/{len(futures)} model definitions read", file=sys.stderr)
-    return definitions, failures
+                yield key, None, " ".join(str(error).split())[:500]
+            else:
+                yield key, definition, None
 
 
-def write_csv(path: Path, rows: list[Any], row_type: type) -> None:
-    """Write dataclass rows to a CSV file that Excel opens with the right encoding."""
-    with path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=[field.name for field in fields(row_type)])
-        writer.writeheader()
-        writer.writerows(asdict(row) for row in rows)
-
-
-def write_outputs(
+def write_outputs(  # noqa: PLR0913
     config: Config,
     models: dict[ModelKey, Model],
     reports: list[Report],
     definitions: dict[ModelKey, dict[str, Any]],
     failures: dict[ModelKey, str],
+    *,
+    final: bool,
 ) -> None:
-    """Write the per-model and per-report results, the object summary, the skipped models and the raw definitions."""
+    """Rewrite the Excel workbook with the models read so far: per model, per report, per object, skipped."""
     model_objects: dict[ModelKey, list[ModelTableObject]] = {
         key: extract_model_objects(definition) for key, definition in definitions.items()
     }
     model_rows = build_model_rows(models, model_objects, reports)
     report_rows = build_lineage_rows(reports, models, model_objects)
-    usages = summarize_objects(report_rows)
     reports_per_model = Counter(report.model for report in reports)
     skipped = [
         SkippedModel(
@@ -205,28 +200,28 @@ def write_outputs(
         )
         for key, reason in failures.items()
     ]
-
-    output_dir = config.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    raw = {f"{key[0]}/{key[1]}": definition for key, definition in definitions.items()}
-    (output_dir / "model_definitions.json").write_text(json.dumps(raw, indent=1), encoding="utf-8")
-    write_csv(output_dir / "model_snowflake_objects.csv", model_rows, ModelObjectRow)
-    write_csv(output_dir / "report_snowflake_lineage.csv", report_rows, LineageRow)
-    write_csv(output_dir / "snowflake_objects.csv", usages, ObjectUsage)
-    write_csv(output_dir / "skipped_models.csv", skipped, SkippedModel)
-
-    print(
-        f"{len(definitions)} models read: {len({row.dataset_id for row in model_rows})} use Snowflake, "
-        f"{len({(row.database, row.schema, row.object_name) for row in model_rows})} distinct Snowflake objects, "
-        f"used by {len({row.report_id for row in report_rows})} reports. "
-        f"{len(skipped)} models could not be read (see skipped_models.csv). "
-        f"Results written to {output_dir.resolve()}",
-        file=sys.stderr,
-    )
+    sheets = {
+        "Model objects": (ModelObjectRow, model_rows),
+        "Report lineage": (LineageRow, report_rows),
+        "Snowflake objects": (ObjectUsage, summarize_objects(report_rows)),
+        "Skipped models": (SkippedModel, skipped),
+    }
+    written = write_workbook(config.output_dir / WORKBOOK_NAME, sheets, final=final)
+    if written is None:
+        print(f"  {WORKBOOK_NAME} is open in Excel: this save is skipped.", file=sys.stderr)
+    elif final:
+        print(
+            f"{len(definitions)} models read: {len({row.dataset_id for row in model_rows})} use Snowflake, "
+            f"{len({(row.database, row.schema, row.object_name) for row in model_rows})} distinct Snowflake "
+            f"objects, used by {len({row.report_id for row in report_rows})} reports. "
+            f"{len(skipped)} models could not be read (see the 'Skipped models' sheet). "
+            f"Results written to {written.resolve()}",
+            file=sys.stderr,
+        )
 
 
 def main() -> None:
-    """Read the configured models and the reports using them, then write the results."""
+    """Read the configured models and the reports using them, saving the results every batch."""
     config = load_config(parse_arguments().config)
     load_dotenv(override=True)
     session = create_session(get_access_token(), pool_size=config.parallel)
@@ -241,10 +236,29 @@ def main() -> None:
     else:
         targets = {key for key in models if key[0] in workspace_ids}
     reports = [report for report in reports if report.model in targets]
-    print(f"Reading {len(targets)} semantic models, used by {len(reports)} reports...", file=sys.stderr)
 
-    definitions, failures = download_definitions(session, list(targets), config.parallel)
-    write_outputs(config, models, reports, definitions, failures)
+    cache_dir = config.output_dir / DEFINITIONS_DIR
+    definitions = load_definitions(cache_dir, targets) if config.reuse_downloaded else {}
+    pending = [key for key in targets if key not in definitions]
+    print(
+        f"{len(targets)} semantic models used by {len(reports)} reports: {len(definitions)} already downloaded "
+        f"in {cache_dir}, {len(pending)} to download.",
+        file=sys.stderr,
+    )
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    failures: dict[ModelKey, str] = {}
+    downloads = download_definitions(session, pending, config.parallel)
+    for done, (key, definition, error) in enumerate(downloads, start=1):
+        if definition is None:
+            failures[key] = error or "unknown error"
+        else:
+            definitions[key] = definition
+            save_definition(cache_dir, key, definition)
+        if done % config.batch_size == 0:
+            print(f"  {done}/{len(pending)} model definitions read, saving {WORKBOOK_NAME}", file=sys.stderr)
+            write_outputs(config, models, reports, definitions, failures, final=False)
+    write_outputs(config, models, reports, definitions, failures, final=True)
 
 
 if __name__ == "__main__":

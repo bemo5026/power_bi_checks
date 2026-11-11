@@ -18,3 +18,12 @@ output_dir = "output"
 
 # Number of model definitions downloaded at the same time.
 parallel = 8
+
+# The Excel workbook (output_dir/snowflake_lineage.xlsx) is rewritten every time this many
+# models are downloaded, so an interrupted run keeps its results.
+batch_size = 25
+
+# Each downloaded model definition is saved in output_dir/model_definitions. With true, a new
+# run reuses them and only downloads the missing models (resume after a crash). Set false, or
+# delete that folder, to download every model again after models have changed.
+reuse_downloaded = true

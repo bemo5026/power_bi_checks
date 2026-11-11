@@ -4,7 +4,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-KNOWN_KEYS = {"workspaces", "semantic_models", "output_dir", "parallel"}
+KNOWN_KEYS = {"workspaces", "semantic_models", "output_dir", "parallel", "batch_size", "reuse_downloaded"}
 
 
 @dataclass(frozen=True)
@@ -16,12 +16,16 @@ class Config:
         semantic_models: Semantic model names or IDs to read. Empty means every model used by a report.
         output_dir: Folder for the result files.
         parallel: Number of model definitions downloaded at the same time.
+        batch_size: The Excel workbook is rewritten every time this many models are downloaded.
+        reuse_downloaded: Reuse the model definitions saved by earlier runs instead of downloading them again.
     """
 
     workspaces: list[str]
     semantic_models: list[str]
     output_dir: Path
     parallel: int
+    batch_size: int
+    reuse_downloaded: bool
 
 
 def _string_list(data: dict[str, object], key: str) -> list[str]:
@@ -49,4 +53,6 @@ def load_config(path: Path) -> Config:
         semantic_models=_string_list(data, "semantic_models"),
         output_dir=Path(data.get("output_dir", "output")),
         parallel=int(data.get("parallel", 8)),
+        batch_size=int(data.get("batch_size", 25)),
+        reuse_downloaded=bool(data.get("reuse_downloaded", True)),
     )

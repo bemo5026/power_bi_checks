@@ -18,6 +18,14 @@ FABRIC_API = "https://api.fabric.microsoft.com/v1"
 REQUEST_TIMEOUT_SECONDS = 120
 OPERATION_TIMEOUT_SECONDS = 600
 DEFAULT_POLL_SECONDS = 3
+DEFINITION_ATTEMPTS = 4
+RETRY_DELAY_SECONDS = 15
+TRANSIENT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+"""Network failures worth retrying: dropped connections and timeouts, also while reading a response."""
 
 
 def create_session(access_token: str, pool_size: int) -> requests.Session:
@@ -111,7 +119,25 @@ def _wait_for_operation(session: requests.Session, response: requests.Response) 
 
 
 def get_model_definition(session: requests.Session, workspace_id: str, model_id: str) -> dict[str, Any]:
-    """Return a semantic model's TMSL definition (the ``model`` object of model.bim)."""
+    """Return a semantic model's TMSL definition (the ``model`` object of model.bim).
+
+    The download is retried from the start when the connection drops or
+    times out, including in the middle of a response body, which the
+    session's own retries don't cover.
+    """
+    attempt = 1
+    while True:
+        try:
+            return _download_model_definition(session, workspace_id, model_id)
+        except TRANSIENT_ERRORS:
+            if attempt == DEFINITION_ATTEMPTS:
+                raise
+            time.sleep(RETRY_DELAY_SECONDS * attempt)
+            attempt += 1
+
+
+def _download_model_definition(session: requests.Session, workspace_id: str, model_id: str) -> dict[str, Any]:
+    """Start the getDefinition operation, wait for it and decode model.bim."""
     response = session.post(
         f"{FABRIC_API}/workspaces/{workspace_id}/semanticModels/{model_id}/getDefinition",
         params={"format": "TMSL"},

@@ -75,15 +75,108 @@ in
     ]
 
 
-def test_sql_tables_skip_ctes_and_table_functions() -> None:
-    """CTE names, subqueries and table functions are not reported as objects."""
+def test_sql_tables_skip_ctes_comments_strings_and_table_functions() -> None:
+    """Only real tables are reported: not CTE names, commented code, text in strings or table functions."""
     sql = """with recent as (select * from db1.s1.orders), totals as (select 1)
-select * from recent
+select * from recent -- from commented_table
 join (select * from s2.items) i on true
 join table(flatten(input => x)) f
-, lateral flatten(input => y)"""
+, lateral flatten(input => y) l
+where note = 'from fake_table'"""
 
-    assert extract_sql_tables(sql) == [("DB1", "S1", "ORDERS"), (None, "S2", "ITEMS")]
+    assert set(extract_sql_tables(sql)) == {("DB1", "S1", "ORDERS"), (None, "S2", "ITEMS")}
+
+
+def test_sql_with_several_datasets_and_statements() -> None:
+    """Joins, unions and several statements report every table once."""
+    sql = """select * from DATASET."dnexr-a" a join DATASET."dnexr-b" b on a.id = b.id
+union all select * from DATASET."dnexr-a";
+select * from LAB.futures"""
+
+    assert set(extract_sql_tables(sql)) == {
+        (None, "DATASET", "dnexr-a"),
+        (None, "DATASET", "dnexr-b"),
+        (None, "LAB", "FUTURES"),
+    }
+
+
+def test_native_query_around_the_connection() -> None:
+    """A native query wrapped around the connector call, with a navigation step without Kind."""
+    expression = (
+        "let\n"
+        '    Source = Value.NativeQuery(Snowflake.Databases("acme.snowflakecomputing.com","DNEXR",'
+        '[Implementation="2.0"]){[Name="DNEXR"]}[Data], '
+        '"select * from DNEXR.DATASET.""dnexr-dnexr-biof-uns-yearly""", null, [EnableFolding=true])\n'
+        "in\n"
+        "    Source"
+    )
+
+    sql = 'select * from DNEXR.DATASET."dnexr-dnexr-biof-uns-yearly"'
+    assert extract_snowflake_objects(expression, {}) == [
+        SnowflakeObject(SERVER, "DNEXR", "DNEXR", "DATASET", "dnexr-dnexr-biof-uns-yearly", "SQL reference", sql),
+    ]
+
+
+def test_navigation_without_kind() -> None:
+    """Without Kind, the level comes from the position: database, schema, then object."""
+    expression = """let
+    Source = Snowflake.Databases("acme.snowflakecomputing.com", "WH", [Implementation="2.0"]),
+    Db = Source{[Name="PROD"]}[Data],
+    Sch = Db{[Name="SALES"]}[Data],
+    T = Sch{[Name="ORDERS"]}[Data]
+in
+    T"""
+
+    assert extract_snowflake_objects(expression, {}) == [
+        SnowflakeObject(SERVER, "WH", "PROD", "SALES", "ORDERS", "Table or view"),
+    ]
+
+
+def test_sql_from_a_step_and_a_parameter() -> None:
+    """SQL kept in a step and built with & from a parameter is resolved."""
+    shared = {"Dataset": '"dnexr-x" meta [IsParameterQuery=true, Type="Text"]'}
+    expression = (
+        "let\n"
+        '    Query = "select * from DATASET.""" & Dataset & """",\n'
+        '    Source = Snowflake.Databases("acme.snowflakecomputing.com", "WH"),\n'
+        '    Db = Source{[Name="PROD", Kind="Database"]}[Data],\n'
+        "    Result = Value.NativeQuery(Db, Query)\n"
+        "in\n"
+        "    Result"
+    )
+
+    [item] = extract_snowflake_objects(expression, shared)
+
+    assert (item.database, item.schema, item.name, item.kind) == ("PROD", "DATASET", "dnexr-x", "SQL reference")
+
+
+def test_unparseable_sql_is_reported() -> None:
+    """SQL that can't be parsed gives one row holding the code instead of disappearing."""
+    expression = """let
+    Source = Snowflake.Databases("acme.snowflakecomputing.com", "WH"),
+    Db = Source{[Name="PROD", Kind="Database"]}[Data],
+    Result = Value.NativeQuery(Db, "select from where (")
+in
+    Result"""
+
+    [item] = extract_snowflake_objects(expression, {})
+
+    assert (item.database, item.name, item.kind) == ("PROD", None, "SQL not parsed")
+    assert item.native_sql == "select from where ("
+
+
+def test_m_comments_are_ignored() -> None:
+    """Navigation in a commented-out step is not reported."""
+    expression = """let
+    Source = Snowflake.Databases("acme.snowflakecomputing.com", "WH"),
+    Db = Source{[Name="PROD", Kind="Database"]}[Data],
+    Sch = Db{[Name="SALES", Kind="Schema"]}[Data],
+    // Old = Sch{[Name="OLD_ORDERS", Kind="Table"]}[Data],
+    T = Sch{[Name="ORDERS", Kind="Table"]}[Data]
+in
+    T"""
+
+    assert [item.name for item in extract_snowflake_objects(expression, {})] == ["ORDERS"]
 
 
 def test_non_snowflake_expression() -> None:
